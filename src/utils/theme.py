@@ -10,6 +10,7 @@ COLORS = {
     "SELECT": "#2A2A2A",
     "ACCENT": "#0078D7",
     "ACCENT_TEXT": "#5DBBFF",
+    "NOTE": "#D6BB7D",
 }
 
 

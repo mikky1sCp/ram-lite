@@ -51,4 +51,20 @@ def stylesheet() -> str:
         background: {c['INPUT']}; border: 1px solid {c['LINE']};
         padding: 4px 6px; min-height: 24px; color: {c['TEXT']};
     }}
+        QCheckBox {{ color: {c['TEXT']}; font-size: 11px; spacing: 6px; }}
+    QCheckBox::indicator {{
+        width: 13px; height: 13px;
+        border: 1px solid {c['LINE']}; background: {c['INPUT']};
+    }}
+    QCheckBox::indicator:checked {{
+        background: {c['ACCENT']}; border: 1px solid {c['ACCENT']};
+    }}
+    QComboBox {{
+        background: {c['INPUT']}; border: 1px solid {c['LINE']};
+        color: {c['TEXT']}; padding: 3px 6px; min-height: 24px;
+    }}
+    QComboBox QAbstractItemView {{
+        background: {c['PANEL']}; color: {c['TEXT']};
+        selection-background-color: {c['SELECT']};
+    }}
     """

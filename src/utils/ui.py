@@ -1,20 +1,30 @@
 from __future__ import annotations
+import os
 import sys
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QDialog, QFrame, QHBoxLayout, QInputDialog, QLabel,
-    QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
-    QMessageBox, QPushButton, QStackedWidget, QTextEdit, QVBoxLayout,
-    QWidget,
+    QApplication, QCheckBox, QComboBox, QDialog, QFrame,
+    QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton,
+    QStackedWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 
-from classes.account_manager import AccountManager
+from classes.account_manager import (  # STEP 6: extended imports
+    AccountManager,
+    AccountManagerError,
+    AccountPasswordError,
+    PasswordRequiredError,
+)
+from classes.encryption import EncryptionConfig  # STEP 6
 from classes.operation_result import OperationResult
-from features import avatars, launcher
+from features import avatars, launcher, multi_roblox
+from features import settings_store
 from utils import theme
+from utils.app_paths import get_data_dir  # STEP 6
 from utils.workers import BackgroundTask
+
 
 _AVATAR_SIZE = 22
 
@@ -95,6 +105,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(800, 520)
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
         self._drag_pos = None
+        self._list_selection_mode_changed()
         self._build()
         self._refresh_accounts()
 
@@ -156,7 +167,7 @@ class MainWindow(QMainWindow):
             )
             lay.addWidget(btn)
         lay.addStretch(1)
-        ver = QLabel("v0.4.0 beta")
+        ver = QLabel("v0.5.0 beta")
         ver.setStyleSheet(f"color: {theme.COLORS['MUTED']}; font-size: 9px;")
         lay.addWidget(ver)
         return panel
@@ -178,6 +189,9 @@ class MainWindow(QMainWindow):
         lay.addWidget(self._search_edit)
 
         self._account_list = QListWidget()
+        self._account_list.setSelectionMode(
+            QListWidget.SelectionMode.ExtendedSelection
+        )
         self._account_list.setContextMenuPolicy(
             Qt.ContextMenuPolicy.CustomContextMenu
         )
@@ -198,17 +212,150 @@ class MainWindow(QMainWindow):
         lay.addLayout(row)
         return page
 
+    def _list_selection_mode_changed(self) -> None:
+        if hasattr(self, "_account_list"):
+            self._account_list.setSelectionMode(
+                QListWidget.SelectionMode.ExtendedSelection
+            )
+
     def _build_settings_page(self) -> QFrame:
         page = QFrame()
         page.setObjectName("centerPanel")
         lay = QVBoxLayout(page)
         lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(10)
         title = QLabel("Settings")
         title.setObjectName("sectionTitle")
         lay.addWidget(title)
-        lay.addWidget(QLabel("Settings will appear here."))
+
+        launcher_lbl = QLabel("Roblox launcher:")
+        launcher_lbl.setStyleSheet(f"color: {theme.COLORS['MUTED']};")
+        lay.addWidget(launcher_lbl)
+        self._launcher_combo = QComboBox()
+        self._launcher_combo.addItem("Default (Windows handler)", "default")
+        self._launcher_combo.addItem("Bloxstrap", "bloxstrap")
+        self._launcher_combo.addItem("Roblox Client (direct .exe)", "client")
+        current = settings_store.get("roblox_launcher", "default")
+        idx = self._launcher_combo.findData(current)
+        if idx >= 0:
+            self._launcher_combo.setCurrentIndex(idx)
+        self._launcher_combo.currentIndexChanged.connect(
+            self._on_launcher_changed
+        )
+        lay.addWidget(self._launcher_combo)
+
+        self._multi_chk = QCheckBox(
+            "Enable Multi Roblox (run several clients at once)"
+        )
+        self._multi_chk.setChecked(multi_roblox.is_enabled())
+        self._multi_chk.toggled.connect(self._on_multi_toggled)
+        lay.addWidget(self._multi_chk)
+
+        hint = QLabel(
+            "Multi Roblox must be enabled before launching a second client. "
+            "Close all Roblox windows before toggling it on."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {theme.COLORS['MUTED']}; font-size: 10px;")
+        lay.addWidget(hint)
+
+        # STEP 6: encryption section
+        enc_title = QLabel("Encryption")
+        enc_title.setStyleSheet(
+            f"color: {theme.COLORS['MUTED']}; margin-top: 12px;"
+        )
+        lay.addWidget(enc_title)
+
+        self._enc_status = QLabel()
+        self._enc_status.setWordWrap(True)
+        self._enc_btn = QPushButton("Enable Encryption...")
+        self._refresh_encryption_widgets()
+        lay.addWidget(self._enc_status)
+        lay.addWidget(self._enc_btn)
+        self._enc_btn.clicked.connect(self._on_enable_encryption)
+
+        enc_hint = QLabel(
+            "AES-GCM with a password. Only the salt is stored on disk — "
+            "the password itself is never saved. If you forget it, "
+            "the saved cookies cannot be recovered."
+        )
+        enc_hint.setWordWrap(True)
+        enc_hint.setStyleSheet(
+            f"color: {theme.COLORS['MUTED']}; font-size: 10px;"
+        )
+        lay.addWidget(enc_hint)
+
         lay.addStretch(1)
         return page
+
+    def _refresh_encryption_widgets(self) -> None:
+        enabled = self._manager.is_encryption_enabled()
+        if enabled:
+            self._enc_status.setText("Encryption: enabled (AES-GCM)")
+            self._enc_status.setStyleSheet(
+                f"color: {theme.COLORS['ACCENT_TEXT']};"
+            )
+        else:
+            self._enc_status.setText(
+                "Encryption: disabled — cookies are stored in plain text."
+            )
+            self._enc_status.setStyleSheet(f"color: {theme.COLORS['NOTE']};")
+        self._enc_btn.setEnabled(not enabled)
+
+    def _on_enable_encryption(self) -> None:
+        pw1, ok = QInputDialog.getText(
+            self, "Enable Encryption",
+            "Choose a password (min. 8 characters).\n"
+            "There is no recovery if you lose it:",
+            QLineEdit.EchoMode.Password,
+        )
+        if not ok or not pw1:
+            return
+        if len(pw1) < 8:
+            QMessageBox.warning(
+                self, "Password Too Short",
+                "Use a password with at least 8 characters.",
+            )
+            return
+        pw2, ok = QInputDialog.getText(
+            self, "Enable Encryption", "Confirm password:",
+            QLineEdit.EchoMode.Password,
+        )
+        if not ok:
+            return
+        if pw1 != pw2:
+            QMessageBox.warning(
+                self, "Passwords Do Not Match", "Try again.",
+            )
+            return
+        result = self._manager.enable_encryption(pw1)
+        if not result:
+            QMessageBox.critical(
+                self, result.title or "Encryption Failed",
+                f"{result.message}\n\nError code: {result.code}",
+            )
+            return
+        QMessageBox.information(self, "Encryption Enabled", result.message)
+        self._refresh_encryption_widgets()
+
+    def _on_launcher_changed(self, _index: int) -> None:
+        settings_store.save(
+            "roblox_launcher", self._launcher_combo.currentData(),
+        )
+
+    def _on_multi_toggled(self, checked: bool) -> None:
+        if checked:
+            result = multi_roblox.enable()
+            if not result:
+                self._multi_chk.blockSignals(True)
+                self._multi_chk.setChecked(False)
+                self._multi_chk.blockSignals(False)
+                QMessageBox.critical(
+                    self, result.title or "Multi Roblox",
+                    f"{result.message}\n\nError code: {result.code}",
+                )
+        else:
+            multi_roblox.disable()
 
     def _build_console_page(self) -> QFrame:
         page = QFrame()
@@ -287,7 +434,9 @@ class MainWindow(QMainWindow):
                 sep.setStyleSheet(f"color: {theme.COLORS['MUTED']};")
                 row_lay.addWidget(sep)
                 note_label = QLabel(note)
-                note_label.setStyleSheet(f"color: {theme.COLORS['NOTE']}; font-weight: 600;")
+                note_label.setStyleSheet(
+                    f"color: {theme.COLORS['NOTE']}; font-weight: 600;"
+                )
                 row_lay.addWidget(note_label)
 
             row_lay.addStretch(1)
@@ -313,6 +462,60 @@ class MainWindow(QMainWindow):
         except RuntimeError:
             pass
 
+    def _selected_usernames(self) -> list[str]:
+        usernames = []
+        for item in self._account_list.selectedItems():
+            username = item.data(Qt.ItemDataRole.UserRole)
+            if username and username in self._manager.accounts:
+                usernames.append(username)
+        return usernames
+
+    def _launch_home_batch(self, usernames: list[str]) -> None:
+        if not multi_roblox.is_enabled():
+            reply = QMessageBox.question(
+                self, "Multi Roblox Required",
+                "Multi Roblox is not enabled. Enable it now? "
+                "All running Roblox windows must be closed first.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            result = multi_roblox.enable()
+            if not result:
+                QMessageBox.critical(
+                    self, result.title or "Multi Roblox",
+                    f"{result.message}\n\nError code: {result.code}",
+                )
+                return
+            self._multi_chk.blockSignals(True)
+            self._multi_chk.setChecked(True)
+            self._multi_chk.blockSignals(False)
+
+        accounts = [
+            (u, dict(self._manager.accounts[u])) for u in usernames
+        ]
+        task = BackgroundTask(
+            lambda: launcher.launch_home_batch(accounts, delay=1.5), self,
+        )
+        task.completed.connect(self._on_batch_launch_done)
+        task.failed.connect(
+            lambda exc: QMessageBox.critical(
+                self, "Batch Launch Failed", str(exc),
+            )
+        )
+        task.start()
+
+    def _on_batch_launch_done(self, result: OperationResult) -> None:
+        if result:
+            QMessageBox.information(self, "Launch Complete", result.message)
+        else:
+            detail = result.detail or ""
+            QMessageBox.warning(
+                self, result.title or "Partial Launch",
+                f"{result.message}\n\n{detail}",
+            )
+
     def _selected_username(self) -> str | None:
         item = self._account_list.currentItem()
         if item is None:
@@ -321,24 +524,35 @@ class MainWindow(QMainWindow):
         return username if username in self._manager.accounts else None
 
     def _on_context_menu(self, pos) -> None:
-        username = self._selected_username()
-        if not username:
+        selected = self._selected_usernames()
+        if not selected:
             return
         menu = QMenu(self)
-        home_action = menu.addAction("Launch Roblox Home")
-        place_action = menu.addAction("Launch Place ID...")
+        if len(selected) == 1:
+            home_action = menu.addAction("Launch Roblox Home")
+            place_action = menu.addAction("Launch Place ID...")
+        else:
+            home_action = None
+            place_action = None
+            batch_action = menu.addAction(
+                f"Launch {len(selected)} Accounts (Home)"
+            )
         menu.addSeparator()
         edit_action = menu.addAction("Edit Note")
         delete_action = menu.addAction("Delete")
         chosen = menu.exec(self._account_list.mapToGlobal(pos))
-        if chosen is home_action:
-            self._launch_home(username)
-        elif chosen is place_action:
-            self._launch_place(username)
+        if not chosen:
+            return
+        if len(selected) == 1 and chosen is home_action:
+            self._launch_home(selected[0])
+        elif len(selected) == 1 and chosen is place_action:
+            self._launch_place(selected[0])
+        elif len(selected) > 1 and chosen is batch_action:
+            self._launch_home_batch(selected)
         elif chosen is edit_action:
-            self._edit_note(username)
+            self._edit_note(selected[0])
         elif chosen is delete_action:
-            self._delete_account(username)
+            self._delete_account(selected[0])
 
     def _on_double_click(self, item: QListWidgetItem) -> None:
         username = item.data(Qt.ItemDataRole.UserRole)
@@ -474,10 +688,41 @@ def _avatar_size_hint():
     return QSize(0, _AVATAR_SIZE + 6)
 
 
-def run() -> int:
+def run() -> int:  # STEP 6: prompt for password when encryption is enabled
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyleSheet(theme.stylesheet())
-    manager = AccountManager()
+
+    data_dir = os.environ.get("RAM_DATA_DIR", "").strip() or get_data_dir()
+    cfg = EncryptionConfig(os.path.join(data_dir, "encryption_config.json"))
+
+    password = None
+    if cfg.is_enabled():
+        password, ok = QInputDialog.getText(
+            None, "Password Required",
+            "Enter your accounts password:",
+            QLineEdit.EchoMode.Password,
+        )
+        if not ok:
+            return 1
+
+    try:
+        manager = AccountManager(password=password)
+    except PasswordRequiredError:
+        QMessageBox.critical(
+            None, "Password Required",
+            "The accounts file is encrypted. Restart and enter a password.",
+        )
+        return 1
+    except AccountPasswordError:
+        QMessageBox.critical(
+            None, "Wrong Password",
+            "The password could not unlock the accounts file.",
+        )
+        return 1
+    except AccountManagerError as exc:
+        QMessageBox.critical(None, "Cannot Open Accounts", str(exc))
+        return 1
+
     window = MainWindow(manager)
     window.show()
     return app.exec()

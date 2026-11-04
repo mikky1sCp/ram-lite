@@ -5,38 +5,140 @@ import os
 import threading
 import time
 
+from classes.encryption import (
+    EncryptionConfig,
+    EncryptedDataError,
+    PasswordDecryptionError,
+    PasswordEncryption,
+)
 from classes.operation_result import OperationResult
 from classes.roblox_api import RobloxAPI
 from utils.app_paths import get_data_dir
 from utils.atomic_io import write_json_atomic
 
 
-class AccountManager:
-    """Stores accounts and handles the cookie-import workflow."""
+class AccountManagerError(Exception):
+    pass
 
-    def __init__(self, data_dir: str | None = None):
+
+class PasswordRequiredError(AccountManagerError):
+    pass
+
+
+class AccountPasswordError(AccountManagerError):
+    pass
+
+
+class AccountManager:
+    def __init__(self, data_dir: str | None = None, password: str | None = None):
         self.data_dir = data_dir or get_data_dir()
         os.makedirs(self.data_dir, exist_ok=True)
         self.accounts_file = os.path.join(self.data_dir, "accounts.json")
+        self.encryption_config = EncryptionConfig(
+            os.path.join(self.data_dir, "encryption_config.json")
+        )
+        self._encryptor: PasswordEncryption | None = None
         self._lock = threading.RLock()
-        self.accounts: dict[str, dict] = self._load()
+
+        if self.encryption_config.is_enabled():
+            if password is None:
+                raise PasswordRequiredError(
+                    "This accounts file is encrypted. A password is required."
+                )
+            salt = self.encryption_config.get_salt()
+            if salt is None:
+                raise AccountManagerError(
+                    "Encryption is enabled but the salt is missing."
+                )
+            self._encryptor = PasswordEncryption(password, salt)
+
+        self.accounts = self._load()
 
     def _load(self) -> dict:
         try:
             with open(self.accounts_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                return data
+                document = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError, OSError):
-            pass
-        return {}
+            return {}
+        if not isinstance(document, dict):
+            return {}
+        if document.get("encrypted"):
+            if self._encryptor is None:
+                raise PasswordRequiredError(
+                    "The accounts file is encrypted but no password was provided."
+                )
+            try:
+                data = self._encryptor.decrypt_data(document.get("data", {}))
+            except PasswordDecryptionError as exc:
+                raise AccountPasswordError(
+                    "Wrong password or corrupted encrypted file."
+                ) from exc
+            except EncryptedDataError as exc:
+                raise AccountManagerError(
+                    f"Encrypted payload is malformed: {exc}"
+                ) from exc
+            return data if isinstance(data, dict) else {}
+        return document
 
     def save_accounts(self) -> None:
         with self._lock:
+            if self._encryptor is not None:
+                payload = self._encryptor.encrypt_data(self.accounts)
+                document = {"encrypted": True, "data": payload}
+            else:
+                document = self.accounts
             write_json_atomic(
-                self.accounts_file, self.accounts,
+                self.accounts_file, document,
                 prefix=".accounts.", fsync=True,
             )
+
+    def is_encryption_enabled(self) -> bool:
+        return self._encryptor is not None
+
+    def enable_encryption(self, password: str) -> OperationResult:
+        if len(password) < 8:
+            return OperationResult.failure(
+                "PASSWORD_TOO_SHORT", "Password Too Short",
+                "Use a password with at least 8 characters.",
+            )
+        if self._encryptor is not None:
+            return OperationResult.failure(
+                "ALREADY_ENCRYPTED", "Already Encrypted",
+                "Encryption is already enabled.",
+            )
+        try:
+            encryptor = PasswordEncryption(password)
+        except Exception as exc:
+            return OperationResult.failure(
+                "ENCRYPTION_INIT_FAILED", "Encryption Failed",
+                f"Could not set up encryption: {exc}",
+            )
+        # Persist the salt first so a crash after re-encrypting the accounts
+        # file still lets the next launch decrypt it.
+        try:
+            self.encryption_config.enable(encryptor.get_salt_b64())
+        except Exception as exc:
+            return OperationResult.failure(
+                "ENCRYPTION_CONFIG_FAILED", "Encryption Failed",
+                f"Could not save encryption config: {exc}",
+            )
+        self._encryptor = encryptor
+        try:
+            self.save_accounts()
+        except Exception as exc:
+            self._encryptor = None
+            try:
+                self.encryption_config.disable()
+            except Exception:
+                pass
+            return OperationResult.failure(
+                "ENCRYPTION_SAVE_FAILED", "Encryption Failed",
+                f"Could not re-encrypt accounts: {exc}",
+            )
+        return OperationResult.success(
+            "Encryption enabled. Keep this password safe — "
+            "there is no recovery if you lose it."
+        )
 
     def import_cookie_account_result(self, cookie: str) -> OperationResult:
         cookie = (cookie or "").strip()

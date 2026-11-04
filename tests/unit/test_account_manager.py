@@ -58,6 +58,16 @@ class AccountManagerTests(unittest.TestCase):
         self.assertIn("alice", reloaded.accounts)
         self.assertEqual(reloaded.accounts["alice"]["cookie"], "good")
 
+    def test_set_note_persists(self):
+        self._import("good")
+        self.assertTrue(self.manager.set_note("alice", "main"))
+        self.assertEqual(self.manager.get_note("alice"), "main")
+        reloaded = AccountManager(data_dir=self.folder.name)
+        self.assertEqual(reloaded.get_note("alice"), "main")
+
+    def test_set_note_missing_account_returns_false(self):
+        self.assertFalse(self.manager.set_note("missing", "x"))
+
 
 if __name__ == "__main__":
     unittest.main()

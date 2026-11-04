@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
 
 from classes.account_manager import AccountManager
 from classes.operation_result import OperationResult
-from features import avatars
+from features import avatars, launcher
 from utils import theme
 from utils.workers import BackgroundTask
 
@@ -156,7 +156,7 @@ class MainWindow(QMainWindow):
             )
             lay.addWidget(btn)
         lay.addStretch(1)
-        ver = QLabel("v0.3.0")
+        ver = QLabel("v0.4.0 beta")
         ver.setStyleSheet(f"color: {theme.COLORS['MUTED']}; font-size: 9px;")
         lay.addWidget(ver)
         return panel
@@ -325,10 +325,17 @@ class MainWindow(QMainWindow):
         if not username:
             return
         menu = QMenu(self)
+        home_action = menu.addAction("Launch Roblox Home")
+        place_action = menu.addAction("Launch Place ID...")
+        menu.addSeparator()
         edit_action = menu.addAction("Edit Note")
         delete_action = menu.addAction("Delete")
         chosen = menu.exec(self._account_list.mapToGlobal(pos))
-        if chosen is edit_action:
+        if chosen is home_action:
+            self._launch_home(username)
+        elif chosen is place_action:
+            self._launch_place(username)
+        elif chosen is edit_action:
             self._edit_note(username)
         elif chosen is delete_action:
             self._delete_account(username)
@@ -347,6 +354,49 @@ class MainWindow(QMainWindow):
             return
         self._manager.set_note(username, note)
         self._refresh_accounts()
+
+    def _launch_home(self, username: str) -> None:
+        data = dict(self._manager.accounts.get(username, {}))
+        if not data:
+            return
+        self._run_launch(username, lambda: launcher.launch_home(data))
+
+    def _launch_place(self, username: str) -> None:
+        data = dict(self._manager.accounts.get(username, {}))
+        if not data:
+            return
+        place_id, ok = QInputDialog.getText(
+            self, f"Launch {username} in Place ID", "Place ID:",
+        )
+        if not ok or not place_id.strip():
+            return
+        self._run_launch(
+            username,
+            lambda: launcher.launch_place(data, place_id.strip()),
+        )
+
+    def _run_launch(self, username: str, work) -> None:
+        task = BackgroundTask(work, self)
+        task.completed.connect(
+            lambda result, u=username: self._on_launch_done(u, result)
+        )
+        task.failed.connect(
+            lambda exc, u=username: self._on_launch_failed(u, exc)
+        )
+        task.start()
+
+    def _on_launch_done(self, username: str, result: OperationResult) -> None:
+        if result:
+            return
+        QMessageBox.critical(
+            self, result.title or "Launch Failed",
+            f"{result.message}\n\nError code: {result.code}",
+        )
+
+    def _on_launch_failed(self, username: str, exc: BaseException) -> None:
+        QMessageBox.critical(
+            self, "Launch Failed", f"{username}: {exc}",
+        )
 
     def _delete_account(self, username: str) -> None:
         reply = QMessageBox.question(

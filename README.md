@@ -33,16 +33,6 @@ A lightweight, personal Roblox account manager for Windows 10/11.
 
 ### Settings
 ![Settings](docs/screenshots/settings.png)
-
-### Multi-launch (context menu)
-![Context menu](docs/screenshots/context-menu.png)
-
-### Multiple Roblox clients running
-![Multi launch](docs/screenshots/launch.png)
-
-### Password prompt on startup
-![Password prompt](docs/screenshots/encryption.png)
-
 ---
 
 ## 📋 Requirements

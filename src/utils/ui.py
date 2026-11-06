@@ -1,28 +1,31 @@
 from __future__ import annotations
 import os
 import sys
+import threading
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QFrame,
+    QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFrame,
     QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton,
     QStackedWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 
-from classes.account_manager import (  # STEP 6: extended imports
+from classes.account_manager import (
     AccountManager,
     AccountManagerError,
     AccountPasswordError,
     PasswordRequiredError,
 )
-from classes.encryption import EncryptionConfig  # STEP 6
+from classes.encryption import EncryptionConfig
 from classes.operation_result import OperationResult
 from features import avatars, launcher, multi_roblox
 from features import settings_store
+from features.cookie_validator import validate_all_cookies
+from features.instance_guard import InstanceGuard  # STEP 8
 from utils import theme
-from utils.app_paths import get_data_dir  # STEP 6
+from utils.app_paths import get_data_dir
 from utils.workers import BackgroundTask
 
 
@@ -93,6 +96,48 @@ class _ImportCookieDialog(QDialog):
             self.accept()
 
 
+class _CookieCheckWorker(QObject):
+    checked = Signal(str, bool)
+    finished = Signal(int, int)
+
+    def __init__(self, manager, delay: float, parent=None):
+        super().__init__(parent)
+        self._manager = manager
+        self._delay = delay
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="cookie-check",
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        try:
+            validate_all_cookies(
+                self._manager,
+                on_progress=self._on_progress,
+                on_done=self._on_done,
+                delay=self._delay,
+                stop_event=self._stop,
+            )
+        except Exception:
+            try:
+                self.finished.emit(0, 0)
+            except Exception:
+                pass
+
+    def _on_progress(self, username: str, is_valid: bool) -> None:
+        self.checked.emit(username, is_valid)
+
+    def _on_done(self, valid: int, invalid: int) -> None:
+        self.finished.emit(valid, invalid)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, manager: AccountManager):
         super().__init__()
@@ -101,6 +146,14 @@ class MainWindow(QMainWindow):
         self._avatar_tasks: list[BackgroundTask] = []
         self._avatar_labels: dict[str, QLabel] = {}
         self._search_query = ""
+        # STEP 7
+        self._cookie_worker: _CookieCheckWorker | None = None
+        self._cookie_badges: dict[str, QLabel] = {}
+        self._cookie_total = 0
+        self._cookie_done = 0
+        # STEP 8
+        self._instance_guard: InstanceGuard | None = None
+
         self.setWindowTitle("RAM Lite")
         self.setMinimumSize(800, 520)
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
@@ -108,6 +161,10 @@ class MainWindow(QMainWindow):
         self._list_selection_mode_changed()
         self._build()
         self._refresh_accounts()
+        QTimer.singleShot(1500, self._start_cookie_check)
+        # STEP 8: auto-start guard when the setting is enabled
+        if settings_store.get("instance_guard_enabled", False):
+            self._on_guard_toggled(True)
 
     def _build(self):
         central = QWidget(self)
@@ -167,7 +224,7 @@ class MainWindow(QMainWindow):
             )
             lay.addWidget(btn)
         lay.addStretch(1)
-        ver = QLabel("v0.5.0 beta")
+        ver = QLabel("v0.7.0 beta")
         ver.setStyleSheet(f"color: {theme.COLORS['MUTED']}; font-size: 9px;")
         lay.addWidget(ver)
         return panel
@@ -181,6 +238,13 @@ class MainWindow(QMainWindow):
         title = QLabel("Accounts")
         title.setObjectName("sectionTitle")
         lay.addWidget(title)
+
+        self._cookie_status = QLabel("")
+        self._cookie_status.setStyleSheet(
+            f"color: {theme.COLORS['MUTED']}; font-size: 10px;"
+        )
+        self._cookie_status.hide()
+        lay.addWidget(self._cookie_status)
 
         self._search_edit = QLineEdit()
         self._search_edit.setPlaceholderText("Search accounts...")
@@ -259,7 +323,38 @@ class MainWindow(QMainWindow):
         hint.setStyleSheet(f"color: {theme.COLORS['MUTED']}; font-size: 10px;")
         lay.addWidget(hint)
 
-        # STEP 6: encryption section
+        # STEP 8: Instance Guard section
+        guard_title = QLabel("Instance Guard (experimental)")
+        guard_title.setStyleSheet(
+            f"color: {theme.COLORS['MUTED']}; margin-top: 12px;"
+        )
+        lay.addWidget(guard_title)
+
+        self._guard_chk = QCheckBox("Keep instances alive")
+        self._guard_chk.setToolTip(
+            "Continuously closes Roblox singleton handles to prevent "
+            "clients from closing when new ones launch.\n"
+            "Uses native handle manipulation — use at your own risk.\n"
+            "Run RAM Lite as administrator for this to work."
+        )
+        self._guard_chk.setChecked(
+            bool(settings_store.get("instance_guard_enabled", False))
+        )
+        self._guard_chk.toggled.connect(self._on_guard_toggled)
+        lay.addWidget(self._guard_chk)
+
+        guard_hint = QLabel(
+            "Requires administrator rights. Manipulates Windows handles "
+            "of Roblox processes. Anti-cheat systems may treat this "
+            "as suspicious activity."
+        )
+        guard_hint.setWordWrap(True)
+        guard_hint.setStyleSheet(
+            f"color: {theme.COLORS['NOTE']}; font-size: 10px;"
+        )
+        lay.addWidget(guard_hint)
+
+        # Encryption section
         enc_title = QLabel("Encryption")
         enc_title.setStyleSheet(
             f"color: {theme.COLORS['MUTED']}; margin-top: 12px;"
@@ -285,8 +380,65 @@ class MainWindow(QMainWindow):
         )
         lay.addWidget(enc_hint)
 
+        # Cookie validation section
+        cookie_title = QLabel("Cookie validation")
+        cookie_title.setStyleSheet(
+            f"color: {theme.COLORS['MUTED']}; margin-top: 12px;"
+        )
+        lay.addWidget(cookie_title)
+
+        self._cookie_check_chk = QCheckBox("Check cookies on startup")
+        self._cookie_check_chk.setChecked(
+            bool(settings_store.get("check_cookies_on_startup", True))
+        )
+        self._cookie_check_chk.toggled.connect(
+            lambda v: settings_store.save("check_cookies_on_startup", v)
+        )
+        lay.addWidget(self._cookie_check_chk)
+
+        delay_row = QHBoxLayout()
+        delay_lbl = QLabel("Delay between checks (seconds):")
+        delay_lbl.setStyleSheet(f"color: {theme.COLORS['MUTED']};")
+        delay_row.addWidget(delay_lbl)
+        delay_row.addStretch(1)
+        self._cookie_delay_spin = QDoubleSpinBox()
+        self._cookie_delay_spin.setRange(0.5, 30.0)
+        self._cookie_delay_spin.setSingleStep(0.5)
+        self._cookie_delay_spin.setDecimals(1)
+        self._cookie_delay_spin.setValue(
+            float(settings_store.get("cookie_check_delay_seconds", 1.5))
+        )
+        self._cookie_delay_spin.valueChanged.connect(
+            lambda v: settings_store.save(
+                "cookie_check_delay_seconds", float(v),
+            )
+        )
+        delay_row.addWidget(self._cookie_delay_spin)
+        lay.addLayout(delay_row)
+
         lay.addStretch(1)
         return page
+
+    # STEP 8: InstanceGuard lifecycle
+    def _on_guard_toggled(self, enabled: bool) -> None:
+        settings_store.save("instance_guard_enabled", enabled)
+        if enabled:
+            if self._instance_guard is None:
+                self._instance_guard = InstanceGuard(interval=3.0)
+            self._instance_guard.start()
+            self._console.setText(
+                "Instance Guard started. It will keep closing singleton "
+                "handles in Roblox processes every 3 seconds."
+            )
+            self._console.setStyleSheet(
+                f"color: {theme.COLORS['ACCENT_TEXT']};"
+            )
+        else:
+            if self._instance_guard is not None:
+                self._instance_guard.stop()
+                self._instance_guard = None
+            self._console.setText("Instance Guard stopped.")
+            self._console.setStyleSheet(f"color: {theme.COLORS['MUTED']};")
 
     def _refresh_encryption_widgets(self) -> None:
         enabled = self._manager.is_encryption_enabled()
@@ -357,6 +509,55 @@ class MainWindow(QMainWindow):
         else:
             multi_roblox.disable()
 
+    def _start_cookie_check(self) -> None:
+        if self._cookie_worker is not None:
+            return
+        if not settings_store.get("check_cookies_on_startup", True):
+            return
+        if not self._manager.accounts:
+            return
+        delay = float(settings_store.get("cookie_check_delay_seconds", 1.5))
+        self._cookie_total = len(self._manager.accounts)
+        self._cookie_done = 0
+        worker = _CookieCheckWorker(self._manager, delay, self)
+        worker.checked.connect(self._on_cookie_checked)
+        worker.finished.connect(self._on_cookie_check_finished)
+        self._cookie_worker = worker
+        self._cookie_status.setText(
+            f"Checking cookies... 0/{self._cookie_total}"
+        )
+        self._cookie_status.show()
+        worker.start()
+
+    def _on_cookie_checked(self, username: str, is_valid: bool) -> None:
+        self._cookie_done += 1
+        if self._cookie_total > 0:
+            self._cookie_status.setText(
+                f"Checking cookies... "
+                f"{self._cookie_done}/{self._cookie_total}"
+            )
+        badge = self._cookie_badges.get(username)
+        if badge is not None:
+            try:
+                badge.setVisible(not is_valid)
+            except RuntimeError:
+                pass
+
+    def _on_cookie_check_finished(self, valid: int, invalid: int) -> None:
+        self._cookie_worker = None
+        self._cookie_status.hide()
+        if invalid > 0:
+            self._console.setText(
+                f"Cookie check: {valid} valid, {invalid} expired. "
+                "Re-import expired cookies via 'Add Account'."
+            )
+            self._console.setStyleSheet(f"color: {theme.COLORS['NOTE']};")
+        elif valid > 0:
+            self._console.setText(
+                f"Cookie check: {valid} valid."
+            )
+            self._console.setStyleSheet(f"color: {theme.COLORS['MUTED']};")
+
     def _build_console_page(self) -> QFrame:
         page = QFrame()
         page.setObjectName("centerPanel")
@@ -367,6 +568,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(title)
         self._console = QLabel("Console output will appear here.")
         self._console.setStyleSheet(f"color: {theme.COLORS['MUTED']};")
+        self._console.setWordWrap(True)
         lay.addWidget(self._console)
         lay.addStretch(1)
         return page
@@ -385,6 +587,7 @@ class MainWindow(QMainWindow):
         self._account_list.clear()
         self._avatar_labels.clear()
         self._avatar_tasks.clear()
+        self._cookie_badges.clear()
 
         visible = [
             (username, data)
@@ -412,6 +615,11 @@ class MainWindow(QMainWindow):
             row_lay.setContentsMargins(4, 0, 6, 0)
             row_lay.setSpacing(6)
 
+            av_container = QWidget()
+            av_container.setFixedSize(_AVATAR_SIZE, _AVATAR_SIZE)
+            av_inner = QHBoxLayout(av_container)
+            av_inner.setContentsMargins(0, 0, 0, 0)
+            av_inner.setSpacing(0)
             av_label = QLabel()
             av_label.setFixedSize(_AVATAR_SIZE, _AVATAR_SIZE)
             av_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -424,7 +632,23 @@ class MainWindow(QMainWindow):
                 user_id = str(data.get("user_id", ""))
                 if user_id and user_id != "0":
                     self._load_avatar_async(user_id, av_label)
-            row_lay.addWidget(av_label)
+            av_inner.addWidget(av_label)
+
+            badge = QLabel(av_container)
+            badge.setFixedSize(8, 8)
+            badge.setStyleSheet(
+                "background: #E5534B; border-radius: 4px; "
+                "border: 1px solid #0E0E0E;"
+            )
+            badge.setToolTip(
+                "Cookie expired — re-import it via 'Add Account'."
+            )
+            badge.move(_AVATAR_SIZE - 8, _AVATAR_SIZE - 8)
+            cookie_valid = data.get("cookie_valid")
+            badge.setVisible(cookie_valid is False)
+            self._cookie_badges[username] = badge
+
+            row_lay.addWidget(av_container)
 
             name_label = QLabel(username)
             row_lay.addWidget(name_label)
@@ -682,13 +906,23 @@ class MainWindow(QMainWindow):
         self._drag_pos = None
         super().mouseReleaseEvent(event)
 
+    def closeEvent(self, event):
+        if self._cookie_worker is not None:
+            self._cookie_worker.stop()
+            self._cookie_worker = None
+        # STEP 8: stop InstanceGuard cleanly
+        if self._instance_guard is not None:
+            self._instance_guard.stop()
+            self._instance_guard = None
+        super().closeEvent(event)
+
 
 def _avatar_size_hint():
     from PySide6.QtCore import QSize
     return QSize(0, _AVATAR_SIZE + 6)
 
 
-def run() -> int:  # STEP 6: prompt for password when encryption is enabled
+def run() -> int:
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyleSheet(theme.stylesheet())
 

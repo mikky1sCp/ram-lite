@@ -77,8 +77,17 @@ class AccountManager:
                 raise AccountManagerError(
                     f"Encrypted payload is malformed: {exc}"
                 ) from exc
-            return data if isinstance(data, dict) else {}
+            result = data if isinstance(data, dict) else {}
+            self._migrate(result)
+            return result
+        self._migrate(document)
         return document
+
+    @staticmethod
+    def _migrate(accounts: dict) -> None:
+        for data in accounts.values():
+            if isinstance(data, dict) and "cookie_valid" not in data:
+                data["cookie_valid"] = None
 
     def save_accounts(self) -> None:
         with self._lock:
@@ -164,6 +173,7 @@ class AccountManager:
                 "user_id": user_id,
                 "note": existing_note,
                 "added_date": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "cookie_valid": True,
             }
             self.save_accounts()
         return OperationResult.success(f"Added {username}.", data=username)
@@ -175,6 +185,16 @@ class AccountManager:
             del self.accounts[username]
             self.save_accounts()
             return True
+
+    def set_cookie_status(
+        self, username: str, is_valid: bool, save: bool = True,
+    ) -> None:
+        with self._lock:
+            if username not in self.accounts:
+                return
+            self.accounts[username]["cookie_valid"] = is_valid
+            if save:
+                self.save_accounts()
 
     def set_note(self, username: str, note: str) -> bool:
         with self._lock:

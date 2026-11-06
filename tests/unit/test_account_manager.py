@@ -68,6 +68,16 @@ class AccountManagerTests(unittest.TestCase):
     def test_set_note_missing_account_returns_false(self):
         self.assertFalse(self.manager.set_note("missing", "x"))
 
+    def test_set_cookie_status_persists(self):
+        self._import("good")
+        self.manager.set_cookie_status("alice", False)
+        reloaded = AccountManager(data_dir=self.folder.name)
+        self.assertFalse(reloaded.accounts["alice"]["cookie_valid"])
+
+    def test_set_cookie_status_missing_account_is_noop(self):
+        self.manager.set_cookie_status("ghost", True)
+        self.assertNotIn("ghost", self.manager.accounts)
+
 
 if __name__ == "__main__":
     unittest.main()
